@@ -125,6 +125,58 @@ local function respond_registry_error(status, code, message)
 end
 
 -- ------------------------------------------------------------
+-- SSRF 加固：判断一个 host 是否指向内网/回环/元数据端点。
+-- auth()（realm 来自上游头）和 prepare_follow()（Location 来自上游头）都要用，
+-- 因此定义在两者之前 —— Lua 的 local 只对其后文本可见，顺序不能反。
+-- 只挡明文 IP 字面量；域名解析后的私网地址不在此拦截范围（DNS rebinding 成本过高）。
+-- ------------------------------------------------------------
+local function is_private_ipv4(ip)
+    local a, b = ip:match("^(%d+)%.(%d+)%.%d+%.%d+$")
+    if not a then return false end
+    a, b = tonumber(a), tonumber(b)
+    if a > 255 or b > 255 then return false end
+    if a == 127 or a == 10 or a == 0 then return true end
+    if a == 169 and b == 254 then return true end          -- 含 169.254.169.254 元数据端点
+    if a == 172 and b >= 16 and b <= 31 then return true end
+    if a == 192 and b == 168 then return true end
+    if a == 100 and b >= 64 and b <= 127 then return true end -- 100.64/10 CGNAT
+    return false
+end
+
+-- host 允许带 [] 包裹的 IPv6 及可选 :port，统一在此归一化后判定。
+local function is_private_host(host)
+    if not host or host == "" then return false end
+
+    -- 去掉 IPv6 的方括号；顺带剥掉普通 host 的 :port。
+    -- "^[^:]+:%d+$" 只匹配「单个冒号 + 端口」的 host:port，天然不会误伤含多个
+    -- 冒号的 IPv6 字面量（那类走下面的 IPv6 分支）。
+    local inner = host:match("^%[([^%]]+)%]")   -- "[::1]:443" / "[::1]" -> "::1"
+    if inner then
+        host = inner
+    else
+        host = host:match("^([^:]+):%d+$") or host  -- "127.0.0.1:5000" -> "127.0.0.1"
+    end
+
+    if host == "localhost" then return true end
+
+    -- IPv6 字面量
+    if host:find(":", 1, true) then
+        local low = host:lower()
+        if low == "::1" or low == "::" then return true end
+        local mapped = low:match("::ffff:(%d+%.%d+%.%d+%.%d+)$")  -- IPv4-mapped
+        if mapped then return is_private_ipv4(mapped) end
+        local first = tonumber(low:match("^(%x+)"), 16)
+        if first then
+            if first >= 0xfc00 and first <= 0xfdff then return true end  -- ULA fc00::/7
+            if first >= 0xfe80 and first <= 0xfebf then return true end  -- link-local fe80::/10
+        end
+        return false
+    end
+
+    return is_private_ipv4(host)
+end
+
+-- ------------------------------------------------------------
 -- 2) 上游鉴权探测（realm / service）
 --    token 不再由我们持有，但 /v2/auth 仍需知道往哪个 realm 转发
 -- ------------------------------------------------------------
@@ -415,6 +467,15 @@ function _M.auth()
         return respond_registry_error(502, "UNAVAILABLE", "bad realm url")
     end
 
+    -- realm 来自上游的 WWW-Authenticate（第三方可控）。这里会带着【客户端的
+    -- Authorization】去连它，所以必须挡住指向内网/元数据端点的 realm，避免被
+    -- 恶意/被攻陷的上游诱导成 SSRF 兼凭据泄露。realm_host 可能带 :port，
+    -- is_private_host 已能归一化处理。
+    if is_private_host(realm_host) then
+        ngx.log(ngx.ERR, "[auth] refusing private/loopback realm: ", realm_host)
+        return respond_registry_error(502, "UNAVAILABLE", "token endpoint not allowed")
+    end
+
     local httpc = http.new()
     httpc:set_timeout(5000)
 
@@ -473,20 +534,6 @@ end
 -- content 阶段时 ngx_http_upstream_create() 已把 r->upstream 清零，读出来是空串。
 local MAX_FOLLOW_HOPS = 4
 
-local function is_private_host(host)
-    -- 只挡明文 IP 字面量；域名解析后的私网地址不在此拦截范围（成本过高）
-    local a, b = host:match("^(%d+)%.(%d+)%.[%d]+%.[%d]+$")
-    if not a then
-        return host == "localhost" or host == "[::1]"
-    end
-    a, b = tonumber(a), tonumber(b)
-    if a == 127 or a == 10 or a == 0 then return true end
-    if a == 169 and b == 254 then return true end          -- 含 169.254.169.254 元数据端点
-    if a == 172 and b >= 16 and b <= 31 then return true end
-    if a == 192 and b == 168 then return true end
-    return false
-end
-
 function _M.prepare_follow()
     local loc = ngx.var.upstream_http_location
 
@@ -514,7 +561,9 @@ function _M.prepare_follow()
         end
     end
 
-    local host = loc:match("^https?://([^/:]+)")
+    -- IPv6 字面量先按 [..] 抓取，否则 [^/:]+ 会在第一个冒号处截断成 "[",
+    -- 使 http://[::1]/ 之类绕过下面的私网校验。
+    local host = loc:match("^https?://(%[[^%]]+%])") or loc:match("^https?://([^/:]+)")
     if not host then
         ngx.log(ngx.ERR, "[follow] cannot parse host from Location: ", loc)
         return ngx.exit(502)
