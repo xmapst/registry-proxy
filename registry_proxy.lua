@@ -143,6 +143,105 @@ local function is_private_ipv4(ip)
     return false
 end
 
+-- 把 IPv6 字面量（已去掉方括号/zone id，小写）解析成 8 个 16bit 分组的数值。
+-- 支持 "::" 压缩，也支持末位内嵌 IPv4（如 "::ffff:169.254.169.254"）。
+-- 不是合法 IPv6 字面量时返回 nil。
+-- 旧实现只按字符串字面量匹配 "::1" / "::" / "::ffff:a.b.c.d"，导致同一地址的
+-- 完全展开写法（如 "0:0:0:0:0:0:0:1"）能绕过检测——这里统一先解出数值分组，
+-- 再分类判断，与写法（压缩/展开/内嵌 IPv4）无关。
+local function parse_ipv6_groups(host)
+    local _, dcolon_count = host:gsub("::", "::")
+    if dcolon_count > 1 then return nil end
+    local has_dc = host:find("::", 1, true) ~= nil
+    local head, tail
+    if has_dc then
+        head, tail = host:match("^(.-)::(.*)$")
+    else
+        head, tail = host, nil
+    end
+
+    local function split(s)
+        local out = {}
+        if s == nil or s == "" then return out end
+        for g in (s .. ":"):gmatch("([^:]*):") do
+            out[#out + 1] = g
+        end
+        return out
+    end
+
+    -- 末位若是 a.b.c.d，展开成两个 16bit 分组
+    local function expand_v4_tail(groups)
+        if #groups == 0 then return groups end
+        local last = groups[#groups]
+        local a, b, c, d = last:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+        if not a then return groups end
+        a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+        if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+        groups[#groups] = nil
+        groups[#groups + 1] = string.format("%x", a * 256 + b)
+        groups[#groups + 1] = string.format("%x", c * 256 + d)
+        return groups
+    end
+
+    local head_groups = expand_v4_tail(split(head))
+    if head_groups == nil then return nil end
+    local tail_groups = nil
+    if has_dc then
+        tail_groups = expand_v4_tail(split(tail))
+        if tail_groups == nil then return nil end
+    end
+
+    local function all_hex(groups)
+        for _, g in ipairs(groups) do
+            if g == "" or not g:match("^%x%x?%x?%x?$") then return false end
+        end
+        return true
+    end
+    if not all_hex(head_groups) then return nil end
+    if tail_groups and not all_hex(tail_groups) then return nil end
+
+    local total = #head_groups + (tail_groups and #tail_groups or 0)
+    if has_dc then
+        if total > 7 then return nil end   -- "::" 至少要代表一个零分组
+    else
+        if total ~= 8 then return nil end
+    end
+
+    local nums = {}
+    for _, g in ipairs(head_groups) do nums[#nums + 1] = tonumber(g, 16) end
+    if has_dc then
+        for _ = 1, 8 - total do nums[#nums + 1] = 0 end
+        if tail_groups then
+            for _, g in ipairs(tail_groups) do nums[#nums + 1] = tonumber(g, 16) end
+        end
+    end
+    if #nums ~= 8 then return nil end
+    return nums
+end
+
+-- 对已解出的 8 分组数值做私网/回环/元数据分类，与写法无关。
+local function is_private_ipv6_groups(g)
+    local all_zero, loopback = true, true
+    for i = 1, 8 do
+        if g[i] ~= 0 then all_zero = false end
+        if i < 8 and g[i] ~= 0 then loopback = false end
+    end
+    if all_zero then return true end                          -- ::
+    if loopback and g[8] == 1 then return true end             -- ::1（含完全展开写法）
+
+    -- IPv4-mapped ::ffff:a.b.c.d，任意写法（压缩/展开/十六进制/点分）
+    if g[1] == 0 and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0 and g[6] == 0xffff then
+        local hi, lo = g[7], g[8]
+        local ip = string.format("%d.%d.%d.%d",
+            math.floor(hi / 256), hi % 256, math.floor(lo / 256), lo % 256)
+        return is_private_ipv4(ip)
+    end
+
+    if g[1] >= 0xfc00 and g[1] <= 0xfdff then return true end  -- ULA fc00::/7
+    if g[1] >= 0xfe80 and g[1] <= 0xfebf then return true end  -- link-local fe80::/10
+    return false
+end
+
 -- host 允许带 [] 包裹的 IPv6 及可选 :port，统一在此归一化后判定。
 local function is_private_host(host)
     if not host or host == "" then return false end
@@ -156,21 +255,20 @@ local function is_private_host(host)
     else
         host = host:match("^([^:]+):%d+$") or host  -- "127.0.0.1:5000" -> "127.0.0.1"
     end
+    host = host:lower()
 
     if host == "localhost" then return true end
 
     -- IPv6 字面量
     if host:find(":", 1, true) then
-        local low = host:lower()
-        if low == "::1" or low == "::" then return true end
-        local mapped = low:match("::ffff:(%d+%.%d+%.%d+%.%d+)$")  -- IPv4-mapped
-        if mapped then return is_private_ipv4(mapped) end
-        local first = tonumber(low:match("^(%x+)"), 16)
-        if first then
-            if first >= 0xfc00 and first <= 0xfdff then return true end  -- ULA fc00::/7
-            if first >= 0xfe80 and first <= 0xfebf then return true end  -- link-local fe80::/10
+        local zone_stripped = host:match("^([^%%]+)") or host  -- 去掉 fe80::1%eth0 之类的 zone id
+        local groups = parse_ipv6_groups(zone_stripped)
+        if not groups then
+            -- 解不出合法 IPv6 字面量：正常 host 不该带冒号走到这里，宁可保守挡掉，
+            -- 不放行未知格式（fail closed）。
+            return true
         end
-        return false
+        return is_private_ipv6_groups(groups)
     end
 
     return is_private_ipv4(host)
